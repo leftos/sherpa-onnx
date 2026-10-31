@@ -79,6 +79,12 @@ struct OfflineRecognitionResult {
   std::string AsJsonString() const;
 };
 
+/// Keep the first k hypotheses of hyps, with k clamped to
+/// [1, max_active_paths]. Used to apply the per-stream option
+/// "num_return_paths" (see OfflineStream::SetOption()).
+void TruncateHypotheses(std::vector<OfflineRecognitionHypothesis> *hyps,
+                        int32_t k, int32_t max_active_paths);
+
 struct WhisperTag {
   int32_t dim = 80;
 

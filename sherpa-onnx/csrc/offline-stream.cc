@@ -439,6 +439,14 @@ float OfflineStream::GetOptionFloat(const std::string &key,
   return impl_->GetOptionFloat(key, default_value);
 }
 
+void TruncateHypotheses(std::vector<OfflineRecognitionHypothesis> *hyps,
+                        int32_t k, int32_t max_active_paths) {
+  k = std::max(1, std::min(k, max_active_paths));
+  if (static_cast<int32_t>(hyps->size()) > k) {
+    hyps->resize(k);
+  }
+}
+
 std::string OfflineRecognitionResult::AsJsonString() const {
   std::ostringstream os;
   os << "{";

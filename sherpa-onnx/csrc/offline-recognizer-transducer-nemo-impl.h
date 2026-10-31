@@ -67,7 +67,7 @@ class OfflineRecognizerTransducerNeMoImpl : public OfflineRecognizerImpl {
           std::make_unique<OfflineTransducerModifiedBeamSearchNeMoDecoder>(
               model_.get(), config_.max_active_paths, unk_id_,
               config_.blank_penalty, model_->IsTDT(), config_.hotwords_score,
-              config_.num_return_paths);
+              config_.max_active_paths);
     } else {
       SHERPA_ONNX_LOGE("Unsupported decoding method: %s",
                        config_.decoding_method.c_str());
@@ -108,7 +108,7 @@ class OfflineRecognizerTransducerNeMoImpl : public OfflineRecognizerImpl {
           std::make_unique<OfflineTransducerModifiedBeamSearchNeMoDecoder>(
               model_.get(), config_.max_active_paths, unk_id_,
               config_.blank_penalty, model_->IsTDT(), config_.hotwords_score,
-              config_.num_return_paths);
+              config_.max_active_paths);
     } else {
       SHERPA_ONNX_LOGE("Unsupported decoding method: %s",
                        config_.decoding_method.c_str());
@@ -216,6 +216,12 @@ class OfflineRecognizerTransducerNeMoImpl : public OfflineRecognizerImpl {
       auto r = Convert(results[i], symbol_table_, frame_shift_ms,
                        model_->SubsamplingFactor(),
                        ss[i]->GetOptionInt("remove_cjk_space", 1));
+      // Per-stream option "num_return_paths": how many of the decoder's
+      // hypotheses to keep, clamped to [1, max_active_paths].
+      TruncateHypotheses(
+          &r.hypotheses,
+          ss[i]->GetOptionInt("num_return_paths", config_.num_return_paths),
+          config_.max_active_paths);
 
       // Remove leading space from BPE tokenization
       if (!r.text.empty() && r.text.front() == ' ') {

@@ -134,7 +134,7 @@ class OfflineRecognizerTransducerImpl : public OfflineRecognizerImpl {
       decoder_ = std::make_unique<OfflineTransducerModifiedBeamSearchDecoder>(
           model_.get(), lm_.get(), config_.max_active_paths,
           config_.lm_config.scale, unk_id_, config_.blank_penalty,
-          config_.num_return_paths);
+          config_.max_active_paths);
     } else {
       SHERPA_ONNX_LOGE("Unsupported decoding method: %s",
                        config_.decoding_method.c_str());
@@ -175,7 +175,7 @@ class OfflineRecognizerTransducerImpl : public OfflineRecognizerImpl {
       decoder_ = std::make_unique<OfflineTransducerModifiedBeamSearchDecoder>(
           model_.get(), lm_.get(), config_.max_active_paths,
           config_.lm_config.scale, unk_id_, config_.blank_penalty,
-          config_.num_return_paths);
+          config_.max_active_paths);
     } else {
       SHERPA_ONNX_LOGE("Unsupported decoding method: %s",
                        config_.decoding_method.c_str());
@@ -277,6 +277,12 @@ class OfflineRecognizerTransducerImpl : public OfflineRecognizerImpl {
       auto r = Convert(results[i], symbol_table_, frame_shift_ms,
                        model_->SubsamplingFactor(),
                        ss[i]->GetOptionInt("remove_cjk_space", 1));
+      // Per-stream option "num_return_paths": how many of the decoder's
+      // hypotheses to keep, clamped to [1, max_active_paths].
+      TruncateHypotheses(
+          &r.hypotheses,
+          ss[i]->GetOptionInt("num_return_paths", config_.num_return_paths),
+          config_.max_active_paths);
       r.text = ApplyInverseTextNormalization(std::move(r.text));
       r.text = ApplyHomophoneReplacer(std::move(r.text));
       for (auto &hyp : r.hypotheses) {

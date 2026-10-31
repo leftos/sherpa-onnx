@@ -5,10 +5,67 @@
 #include "sherpa-onnx/csrc/offline-stream.h"
 
 #include <string>
+#include <vector>
 
 #include "gtest/gtest.h"
 
 namespace sherpa_onnx {
+
+static std::vector<OfflineRecognitionHypothesis> MakeHypotheses(
+    const std::vector<std::string> &texts) {
+  std::vector<OfflineRecognitionHypothesis> hyps;
+  for (const auto &text : texts) {
+    OfflineRecognitionHypothesis hyp;
+    hyp.text = text;
+    hyps.push_back(hyp);
+  }
+  return hyps;
+}
+
+static std::vector<std::string> Texts(
+    const std::vector<OfflineRecognitionHypothesis> &hyps) {
+  std::vector<std::string> texts;
+  for (const auto &hyp : hyps) {
+    texts.push_back(hyp.text);
+  }
+  return texts;
+}
+
+TEST(TruncateHypotheses, ZeroKeepsOne) {
+  auto hyps = MakeHypotheses({"a", "b", "c", "d"});
+  TruncateHypotheses(&hyps, 0, 4);
+  EXPECT_EQ(Texts(hyps), (std::vector<std::string>{"a"}));
+}
+
+TEST(TruncateHypotheses, OneKeepsOne) {
+  auto hyps = MakeHypotheses({"a", "b", "c", "d"});
+  TruncateHypotheses(&hyps, 1, 4);
+  EXPECT_EQ(Texts(hyps), (std::vector<std::string>{"a"}));
+}
+
+TEST(TruncateHypotheses, ThreeKeepsFirstThreeInOrder) {
+  auto hyps = MakeHypotheses({"a", "b", "c", "d"});
+  TruncateHypotheses(&hyps, 3, 4);
+  EXPECT_EQ(Texts(hyps), (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST(TruncateHypotheses, LargerThanListKeepsAll) {
+  auto hyps = MakeHypotheses({"a", "b"});
+  TruncateHypotheses(&hyps, 3, 4);
+  EXPECT_EQ(Texts(hyps), (std::vector<std::string>{"a", "b"}));
+}
+
+TEST(TruncateHypotheses, LargerThanMaxActivePathsKeepsMaxActivePaths) {
+  auto hyps = MakeHypotheses({"a", "b", "c", "d"});
+  TruncateHypotheses(&hyps, 10, 3);
+  EXPECT_EQ(Texts(hyps), (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST(TruncateHypotheses, EmptyListStaysEmpty) {
+  std::vector<OfflineRecognitionHypothesis> hyps;
+  TruncateHypotheses(&hyps, 2, 4);
+  EXPECT_TRUE(hyps.empty());
+}
 
 TEST(OfflineRecognitionResult, SerializesNBestHypotheses) {
   OfflineRecognitionResult result;
