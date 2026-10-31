@@ -19,18 +19,18 @@ if(NOT SHERPA_ONNX_ENABLE_GPU)
   message(FATAL_ERROR "This file is for NVIDIA GPU only. Given SHERPA_ONNX_ENABLE_GPU: ${SHERPA_ONNX_ENABLE_GPU}")
 endif()
 
-# Requires cuda 12.x, cudnn 9.x
-set(onnxruntime_URL  "https://github.com/microsoft/onnxruntime/releases/download/v1.28.2/onnxruntime-win-x64-gpu_cuda12-1.28.2.zip")
-set(onnxruntime_HASH "SHA256=5b5ceb06e90405c7de9acdaf5aa06d288768e6a1e5dc54337281e09c03fc60f9")
+# Requires cuda 13.x, cudnn 9.x
+set(onnxruntime_URL  "https://github.com/microsoft/onnxruntime/releases/download/v1.28.2/onnxruntime-win-x64-gpu_cuda13-1.28.2.zip")
+set(onnxruntime_HASH "SHA256=4b7a2d01a3cc96b12d06c8266af2c8f42c96365c4a0100d45fd874c71b4a2e19")
 
 # If you don't have access to the Internet,
 # please download onnxruntime to one of the following locations.
 # You can add more if you want.
 set(possible_file_locations
-  $ENV{HOME}/Downloads/onnxruntime-win-x64-gpu_cuda12-1.28.2.zip
-  ${CMAKE_SOURCE_DIR}/onnxruntime-win-x64-gpu_cuda12-1.28.2.zip
-  ${CMAKE_BINARY_DIR}/onnxruntime-win-x64-gpu_cuda12-1.28.2.zip
-  /tmp/onnxruntime-win-x64-gpu_cuda12-1.28.2.zip
+  $ENV{HOME}/Downloads/onnxruntime-win-x64-gpu_cuda13-1.28.2.zip
+  ${CMAKE_SOURCE_DIR}/onnxruntime-win-x64-gpu_cuda13-1.28.2.zip
+  ${CMAKE_BINARY_DIR}/onnxruntime-win-x64-gpu_cuda13-1.28.2.zip
+  /tmp/onnxruntime-win-x64-gpu_cuda13-1.28.2.zip
 )
 
 foreach(f IN LISTS possible_file_locations)
