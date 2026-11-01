@@ -1,0 +1,509 @@
+name: yaat-natives
+
+# Builds the sherpa-onnx C API shared library (and the onnxruntime it loads)
+# for every RID the YAAT client ships. Each job uploads one zip whose files
+# carry the names the org.k2fsa.sherpa.onnx.runtime.<rid> 2.0.1 NuGet packages
+# use, plus a MANIFEST.txt, so the client can overlay it on the NuGet natives.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yaat-natives-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_CMAKE_FLAGS: >-
+    -DCMAKE_BUILD_TYPE=Release
+    -DBUILD_SHARED_LIBS=ON
+    -DSHERPA_ONNX_ENABLE_C_API=ON
+    -DSHERPA_ONNX_ENABLE_PYTHON=OFF
+    -DSHERPA_ONNX_ENABLE_TESTS=OFF
+    -DSHERPA_ONNX_ENABLE_BINARY=OFF
+    -DSHERPA_ONNX_ENABLE_JNI=OFF
+    -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF
+    -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF
+  BASE_COMMIT: 935e5ded
+  MODEL: sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8
+  MODEL_URL: https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2
+
+jobs:
+  windows:
+    name: ${{ matrix.variant }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: win-x64-cpu
+            gpu: "OFF"
+            smoke: true
+          - variant: win-x64-cuda
+            gpu: "ON"
+            smoke: false
+    env:
+      VARIANT: ${{ matrix.variant }}
+      GPU: ${{ matrix.gpu }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: bash
+        run: |
+          read -r -a flags <<< "$BASE_CMAKE_FLAGS -DSHERPA_ONNX_ENABLE_GPU=$GPU"
+          mkdir -p yaat-out
+          echo "cmake -S . -B build -A x64 ${flags[*]}" > yaat-out/cmake-line.txt
+          cmake -S . -B build -A x64 "${flags[@]}" 2>&1 | tee yaat-out/configure.log
+
+      - name: Build sherpa-onnx-c-api
+        shell: bash
+        run: cmake --build build --config Release --target sherpa-onnx-c-api --parallel
+
+      - name: Collect libraries
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          ort_lib=build/_deps/onnxruntime-src/lib
+          mkdir -p "$stage"
+          ls -l "$ort_lib"
+
+          cp -v build/bin/Release/sherpa-onnx-c-api.dll "$stage/"
+          cp -v "$ort_lib/onnxruntime.dll" "$stage/"
+          if [[ "$GPU" == ON ]]; then
+            cp -v "$ort_lib/onnxruntime_providers_cuda.dll" "$ort_lib/onnxruntime_providers_shared.dll" "$stage/"
+            ort_cmake=cmake/onnxruntime-win-x64-gpu.cmake
+            hash_var=onnxruntime_HASH
+          else
+            ort_cmake=cmake/onnxruntime-win-x64.cmake
+            crt=$(tr -d '\r' < yaat-out/configure.log | sed -n 's/.*Use MSVC CRT: \(M[DT]\).*/\1/p' | head -n 1)
+            hash_var="ONNXRUNTIME_HASH_${crt}_Release"
+          fi
+
+          url=$(tr -d '\r' < yaat-out/configure.log | sed -n 's/.*Downloading onnxruntime from //p' | head -n 1)
+          hash=$(tr -d '\r' < "$ort_cmake" | sed -n "s/^set(${hash_var} *\"SHA256=\([0-9a-f]*\)\").*/\1/p")
+          if [[ "$url" != https://* || ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::cannot read the onnxruntime URL ('$url') or hash ('$hash', $hash_var in $ort_cmake)"
+            exit 1
+          fi
+          printf '%s\n%s\n' "$url" "$hash" > yaat-out/ort.txt
+          ls -l "$stage"
+
+      - name: Check dependency names
+        shell: pwsh
+        run: |
+          $stage = "yaat-out/$env:VARIANT"
+          $deps = dumpbin /nologo /dependents "$stage/sherpa-onnx-c-api.dll"
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
+          $deps | Write-Output
+          $ort = @($deps | ForEach-Object { $_.Trim() } | Where-Object { $_ -imatch '^onnxruntime.*\.dll$' })
+          if ($ort.Count -eq 0) { throw "sherpa-onnx-c-api.dll names no onnxruntime DLL" }
+          foreach ($name in $ort) {
+            if (-not (Test-Path -LiteralPath "$stage/$name")) {
+              throw "sherpa-onnx-c-api.dll asks for $name, which is not in $stage"
+            }
+            Write-Output "ok: sherpa-onnx-c-api.dll asks for $name, shipped"
+          }
+
+      - name: Write MANIFEST.txt and zip
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+          {
+            echo "sherpa-onnx native ($VARIANT), branch $GITHUB_REF_NAME"
+            echo "HEAD: $(git rev-parse HEAD)"
+            echo
+            echo "git log --oneline $BASE_COMMIT..HEAD:"
+            git log --oneline "$BASE_COMMIT..HEAD"
+            echo
+            echo "CMake configure:"
+            cat yaat-out/cmake-line.txt
+            echo
+            echo "onnxruntime URL: $(sed -n 1p yaat-out/ort.txt)"
+            echo "onnxruntime SHA-256: $(sed -n 2p yaat-out/ort.txt)"
+            echo "DLL SHA-256:"
+            for f in "$stage"/*; do
+              echo "$(sha256 "$f")  $(basename "$f")"
+            done
+          } > yaat-out/MANIFEST.txt
+          mv yaat-out/MANIFEST.txt "$stage/"
+          cat "$stage/MANIFEST.txt"
+          (cd "$stage" && 7z a -tzip "../$VARIANT.zip" ./*)
+          7z l "yaat-out/$VARIANT.zip"
+
+      - name: Build smoke test
+        if: matrix.smoke
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path smoke | Out-Null
+          Copy-Item -Path "yaat-out/$env:VARIANT/*" -Destination smoke
+          cl /nologo /W3 /I . yaat\smoke-nbest.c /Fe:smoke\smoke-nbest.exe /link build\lib\Release\sherpa-onnx-c-api.lib
+          if ($LASTEXITCODE -ne 0) { throw "cl failed with exit code $LASTEXITCODE" }
+
+      - name: Run smoke test
+        if: matrix.smoke
+        shell: bash
+        run: |
+          curl -fSL -o "$MODEL.tar.bz2" "$MODEL_URL"
+          tar xf "$MODEL.tar.bz2"
+          ls -l "$MODEL"
+          ./smoke/smoke-nbest.exe "$MODEL"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.variant }}.zip
+          path: yaat-out/${{ matrix.variant }}.zip
+          if-no-files-found: error
+
+  linux:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The images and the devtoolset-11 setup are upstream's: linux.yaml
+          # (shared CPU build) and linux-gpu.yaml (GPU build).
+          - variant: linux-x64-cpu
+            gpu: "OFF"
+            image: quay.io/pypa/manylinux2014_x86_64
+            devtoolset: "11"
+            ort_cmake: cmake/onnxruntime-linux-x86_64.cmake
+            smoke: true
+          - variant: linux-x64-cuda
+            gpu: "ON"
+            image: quay.io/pypa/manylinux_2_28_x86_64
+            devtoolset: ""
+            ort_cmake: cmake/onnxruntime-linux-x86_64-gpu.cmake
+            smoke: false
+    env:
+      VARIANT: ${{ matrix.variant }}
+      GPU: ${{ matrix.gpu }}
+      IMAGE: ${{ matrix.image }}
+      DEVTOOLSET: ${{ matrix.devtoolset }}
+      ORT_CMAKE: ${{ matrix.ort_cmake }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure and build sherpa-onnx-c-api in the manylinux container
+        shell: bash
+        run: |
+          read -r -a flags <<< "$BASE_CMAKE_FLAGS -DSHERPA_ONNX_ENABLE_GPU=$GPU"
+          mkdir -p yaat-out
+          echo "cmake -S . -B build ${flags[*]}" > yaat-out/cmake-line.txt
+
+          docker run --rm \
+            -e BASE_CMAKE_FLAGS -e GPU -e DEVTOOLSET \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            "$IMAGE" \
+            bash -c '
+              set -eo pipefail
+              if [[ -n "$DEVTOOLSET" ]]; then
+                # See https://github.com/nealef/clefos/issues/9
+                echo "multilib_policy=best" >> /etc/yum.conf
+                echo "skip_missing_names_on_install=False" >> /etc/yum.conf
+                sed -i "/^override_install_langs=/d" /etc/yum.conf
+                yum -y update
+                yum -y install yum-utils curl
+                yum-config-manager --enable extras
+                yum -y install centos-release-scl-rh
+                yum -y install devtoolset-$DEVTOOLSET-binutils devtoolset-$DEVTOOLSET-gcc devtoolset-$DEVTOOLSET-gcc-c++
+                source /opt/rh/devtoolset-$DEVTOOLSET/enable
+              fi
+              gcc --version
+              cmake --version
+              cat /etc/*release
+
+              read -r -a flags <<< "$BASE_CMAKE_FLAGS -DSHERPA_ONNX_ENABLE_GPU=$GPU"
+              cmake -S . -B build "${flags[@]}" 2>&1 | tee yaat-out/configure.log
+              cmake --build build --target sherpa-onnx-c-api --parallel "$(nproc)"
+            '
+
+          sudo chown -R "$(id -u):$(id -g)" build yaat-out
+
+      - name: Collect libraries
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          ort_lib=build/_deps/onnxruntime-src/lib
+          mkdir -p "$stage"
+          ls -l "$ort_lib"
+
+          cp -v build/lib/libsherpa-onnx-c-api.so "$stage/"
+          if [[ -e "$ort_lib/libonnxruntime.so" ]]; then
+            ort_src="$ort_lib/libonnxruntime.so"
+          else
+            mapfile -t real < <(for f in "$ort_lib"/libonnxruntime.so.*; do readlink -f "$f"; done | sort -u)
+            if [[ ${#real[@]} -ne 1 ]]; then
+              echo "::error::expected one onnxruntime library in $ort_lib, found: ${real[*]}"
+              exit 1
+            fi
+            ort_src="${real[0]}"
+          fi
+          cp -vL "$ort_src" "$stage/libonnxruntime.so"
+          if [[ "$GPU" == ON ]]; then
+            cp -vL "$ort_lib/libonnxruntime_providers_cuda.so" "$ort_lib/libonnxruntime_providers_shared.so" "$stage/"
+          fi
+
+          url=$(sed -n 's/.*Downloading onnxruntime from //p' yaat-out/configure.log | head -n 1)
+          hash=$(sed -n 's/^set(onnxruntime_HASH *"SHA256=\([0-9a-f]*\)").*/\1/p' "$ORT_CMAKE")
+          if [[ "$url" != https://* || ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::cannot read the onnxruntime URL ('$url') or hash ('$hash' in $ORT_CMAKE)"
+            exit 1
+          fi
+          printf '%s\n%s\n' "$url" "$hash" > yaat-out/ort.txt
+          ls -l "$stage"
+
+      - name: Check dependency names
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          lib="$stage/libsherpa-onnx-c-api.so"
+          readelf -d "$lib"
+          mapfile -t ort < <(readelf -d "$lib" | sed -n 's/.*(NEEDED).*\[\(libonnxruntime[^]]*\)\]/\1/p')
+          if [[ ${#ort[@]} -eq 0 ]]; then
+            echo "::error::libsherpa-onnx-c-api.so names no onnxruntime library"
+            exit 1
+          fi
+          for name in "${ort[@]}"; do
+            if [[ ! -e "$stage/$name" ]]; then
+              echo "libsherpa-onnx-c-api.so asks for the versioned name $name; shipping it as well"
+              cp -v "$stage/libonnxruntime.so" "$stage/$name"
+            fi
+            echo "ok: libsherpa-onnx-c-api.so asks for $name, shipped"
+          done
+
+      - name: Write MANIFEST.txt and zip
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+          {
+            echo "sherpa-onnx native ($VARIANT), branch $GITHUB_REF_NAME"
+            echo "HEAD: $(git rev-parse HEAD)"
+            echo
+            echo "git log --oneline $BASE_COMMIT..HEAD:"
+            git log --oneline "$BASE_COMMIT..HEAD"
+            echo
+            echo "CMake configure:"
+            cat yaat-out/cmake-line.txt
+            echo
+            echo "onnxruntime URL: $(sed -n 1p yaat-out/ort.txt)"
+            echo "onnxruntime SHA-256: $(sed -n 2p yaat-out/ort.txt)"
+            echo "DLL SHA-256:"
+            for f in "$stage"/*; do
+              echo "$(sha256 "$f")  $(basename "$f")"
+            done
+          } > yaat-out/MANIFEST.txt
+          mv yaat-out/MANIFEST.txt "$stage/"
+          cat "$stage/MANIFEST.txt"
+          (cd "$stage" && zip -X "../$VARIANT.zip" ./*)
+          unzip -l "yaat-out/$VARIANT.zip"
+
+      - name: Smoke test
+        if: matrix.smoke
+        shell: bash
+        run: |
+          mkdir smoke
+          cp -a "yaat-out/$VARIANT"/. smoke/
+          gcc -O2 -I . yaat/smoke-nbest.c -o smoke/smoke-nbest \
+            -L smoke -l sherpa-onnx-c-api \
+            -Wl,-rpath-link,smoke -Wl,-rpath,\$ORIGIN
+          curl -fSL -o "$MODEL.tar.bz2" "$MODEL_URL"
+          tar xf "$MODEL.tar.bz2"
+          ls -l "$MODEL"
+          ./smoke/smoke-nbest "$MODEL"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.variant }}.zip
+          path: yaat-out/${{ matrix.variant }}.zip
+          if-no-files-found: error
+
+  macos:
+    name: ${{ matrix.variant }}
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: osx-arm64
+            arch: arm64
+            ort_cmake: cmake/onnxruntime-osx-arm64.cmake
+          # Cross-built on the arm64 runner, as upstream macos.yaml builds by arch on macos-latest.
+          - variant: osx-x64
+            arch: x86_64
+            ort_cmake: cmake/onnxruntime-osx-x86_64.cmake
+    env:
+      VARIANT: ${{ matrix.variant }}
+      ARCH: ${{ matrix.arch }}
+      ORT_CMAKE: ${{ matrix.ort_cmake }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure
+        shell: bash
+        run: |
+          read -r -a flags <<< "$BASE_CMAKE_FLAGS -DCMAKE_OSX_ARCHITECTURES=$ARCH"
+          mkdir -p yaat-out
+          echo "cmake -S . -B build ${flags[*]}" > yaat-out/cmake-line.txt
+          cmake -S . -B build "${flags[@]}" 2>&1 | tee yaat-out/configure.log
+
+      - name: Build sherpa-onnx-c-api
+        shell: bash
+        run: cmake --build build --target sherpa-onnx-c-api --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Collect libraries
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          ort_lib=build/_deps/onnxruntime-src/lib
+          mkdir -p "$stage"
+          ls -l "$ort_lib"
+
+          cp -v build/lib/libsherpa-onnx-c-api.dylib "$stage/"
+          if [[ -e "$ort_lib/libonnxruntime.dylib" ]]; then
+            ort_src="$ort_lib/libonnxruntime.dylib"
+          else
+            real=$(for f in "$ort_lib"/libonnxruntime.*.dylib; do readlink -f "$f"; done | sort -u)
+            if [[ $(printf '%s\n' "$real" | wc -l) -ne 1 || -z "$real" ]]; then
+              echo "::error::expected one onnxruntime library in $ort_lib, found: $real"
+              exit 1
+            fi
+            ort_src="$real"
+          fi
+          cp -vL "$ort_src" "$stage/libonnxruntime.dylib"
+
+          url=$(sed -n 's/.*Downloading onnxruntime from //p' yaat-out/configure.log | head -n 1)
+          hash=$(sed -n 's/^set(onnxruntime_HASH *"SHA256=\([0-9a-f]*\)").*/\1/p' "$ORT_CMAKE")
+          if [[ "$url" != https://* || ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::cannot read the onnxruntime URL ('$url') or hash ('$hash' in $ORT_CMAKE)"
+            exit 1
+          fi
+          printf '%s\n%s\n' "$url" "$hash" > yaat-out/ort.txt
+          ls -l "$stage"
+          lipo -info "$stage"/*.dylib
+
+      - name: Check dependency names and install names
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          lib="$stage/libsherpa-onnx-c-api.dylib"
+          otool -L "$lib"
+          ort=$(otool -L "$lib" | awk 'NR > 1 { print $1 }' | grep onnxruntime || true)
+          if [[ -z "$ort" ]]; then
+            echo "::error::libsherpa-onnx-c-api.dylib names no onnxruntime library"
+            exit 1
+          fi
+          while IFS= read -r ref; do
+            name=$(basename "$ref")
+            case "$ref" in
+              @rpath/* | @loader_path/*) ;;
+              *)
+                echo "install name $ref is not @rpath or @loader_path; rewriting it to @rpath/$name"
+                install_name_tool -change "$ref" "@rpath/$name" "$lib"
+                ;;
+            esac
+            if [[ ! -e "$stage/$name" ]]; then
+              echo "libsherpa-onnx-c-api.dylib asks for the versioned name $name; shipping it as well"
+              cp -v "$stage/libonnxruntime.dylib" "$stage/$name"
+            fi
+          done <<< "$ort"
+
+          if ! otool -l "$lib" | grep -A 2 LC_RPATH | grep -q '@loader_path'; then
+            echo "adding @loader_path to the rpath of $lib"
+            install_name_tool -add_rpath @loader_path "$lib"
+          fi
+
+          for f in "$stage"/*.dylib; do
+            codesign --force --sign - "$f"
+            codesign --verify --strict "$f"
+          done
+
+          otool -L "$lib"
+          otool -l "$lib" | grep -A 2 LC_RPATH
+          while IFS= read -r ref; do
+            name=$(basename "$ref")
+            case "$ref" in
+              @rpath/* | @loader_path/*) ;;
+              *)
+                echo "::error::install name $ref is still not @rpath or @loader_path"
+                exit 1
+                ;;
+            esac
+            if [[ ! -e "$stage/$name" ]]; then
+              echo "::error::libsherpa-onnx-c-api.dylib asks for $name, which is not in $stage"
+              exit 1
+            fi
+            echo "ok: libsherpa-onnx-c-api.dylib asks for $ref, shipped as $name"
+          done < <(otool -L "$lib" | awk 'NR > 1 { print $1 }' | grep onnxruntime)
+
+      - name: Write MANIFEST.txt and zip
+        shell: bash
+        run: |
+          stage="yaat-out/$VARIANT"
+          sha256() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+          {
+            echo "sherpa-onnx native ($VARIANT), branch $GITHUB_REF_NAME"
+            echo "HEAD: $(git rev-parse HEAD)"
+            echo
+            echo "git log --oneline $BASE_COMMIT..HEAD:"
+            git log --oneline "$BASE_COMMIT..HEAD"
+            echo
+            echo "CMake configure:"
+            cat yaat-out/cmake-line.txt
+            echo
+            echo "onnxruntime URL: $(sed -n 1p yaat-out/ort.txt)"
+            echo "onnxruntime SHA-256: $(sed -n 2p yaat-out/ort.txt)"
+            echo "DLL SHA-256:"
+            for f in "$stage"/*; do
+              echo "$(sha256 "$f")  $(basename "$f")"
+            done
+          } > yaat-out/MANIFEST.txt
+          mv yaat-out/MANIFEST.txt "$stage/"
+          cat "$stage/MANIFEST.txt"
+          (cd "$stage" && zip -X "../$VARIANT.zip" ./*)
+          unzip -l "yaat-out/$VARIANT.zip"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          if [[ "$ARCH" != arm64 ]] && ! arch "-$ARCH" /usr/bin/true; then
+            echo "::notice::this runner cannot execute $ARCH code (no Rosetta); skipping the $VARIANT smoke test"
+            exit 0
+          fi
+          mkdir smoke
+          cp -a "yaat-out/$VARIANT"/. smoke/
+          clang -arch "$ARCH" -O2 -I . yaat/smoke-nbest.c -o smoke/smoke-nbest \
+            -L smoke -l sherpa-onnx-c-api -Wl,-rpath,@executable_path
+          curl -fSL -o "$MODEL.tar.bz2" "$MODEL_URL"
+          tar xf "$MODEL.tar.bz2"
+          ls -l "$MODEL"
+          arch "-$ARCH" ./smoke/smoke-nbest "$MODEL"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.variant }}.zip
+          path: yaat-out/${{ matrix.variant }}.zip
+          if-no-files-found: error
